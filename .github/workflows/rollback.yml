@@ -1,0 +1,48 @@
+name: Rollback
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        type: choice
+        required: true
+        options: [staging, production]
+      to_sha:
+        description: "Commit SHA to roll back to (optional). If omitted, uses previous.txt marker in S3."
+        required: false
+permissions:
+  id-token: write
+  contents: read
+env:
+  AWS_REGION: us-east-1
+  ECR_REPO: ${{ vars.ECR_REPO || 'saas-example-app' }}
+  ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
+jobs:
+  rollback:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure AWS (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ (github.event.inputs.environment == 'staging' && secrets.AWS_ROLE_ARN_STAGING) || secrets.AWS_ROLE_ARN_PROD }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Determine SHA
+        id: pick
+        run: |
+          ENV="${{ github.event.inputs.environment }}"
+          if [ -n "${{ github.event.inputs.to_sha }}" ]; then
+            SHA="${{ github.event.inputs.to_sha }}"
+          else
+            META_BUCKET="${{ vars.ARTIFACT_BUCKET }}"
+            SHA=$(aws s3 cp "s3://$META_BUCKET/deployments/$ENV/previous.txt" - 2>/dev/null || echo "")
+          fi
+          if [ -z "$SHA" ]; then
+            echo "No rollback SHA found"; exit 1
+          fi
+          echo "sha=$SHA" >> $GITHUB_OUTPUT
+      - name: Redeploy that image
+        run: |
+          ENV="${{ github.event.inputs.environment }}"
+          SHA="${{ steps.pick.outputs.sha }}"
+          IMAGE="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO}:${ENV}-${SHA}"
+          SECRET="${{ (github.event.inputs.environment == 'staging' && vars.STAGING_SECRET_ARN) || vars.PROD_SECRET_ARN }}"
+          aws ssm send-command             --document-name "AWS-RunShellScript"             --targets "Key=tag:Environment,Values=$ENV"             --parameters 'commands=["/usr/local/bin/deploy_app.sh '"$ENV"' '"$IMAGE"' '"$SECRET"' 80"]'             --comment "Rollback $ENV to $SHA"

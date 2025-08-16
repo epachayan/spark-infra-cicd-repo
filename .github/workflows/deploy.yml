@@ -1,0 +1,89 @@
+name: CD (deploy via ECR + SSM)
+on:
+  push:
+    branches: ["develop"]
+  release:
+    types: [published]
+permissions:
+  id-token: write
+  contents: read
+env:
+  AWS_REGION: us-east-1
+  ECR_REPO: ${{ vars.ECR_REPO || 'saas-example-app' }}
+  ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
+jobs:
+  deploy-staging:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/develop'
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20 }
+      - name: Configure AWS (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_STAGING }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Login to ECR
+        uses: aws-actions/amazon-ecr-login@v2
+      - name: Build and push
+        run: |
+          IMAGE="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO}"
+          TAG="staging-${{ github.sha }}"
+          docker build -t "$IMAGE:$TAG" -f app/Dockerfile app
+          docker tag "$IMAGE:$TAG" "$IMAGE:staging"
+          docker push "$IMAGE:$TAG"
+          docker push "$IMAGE:staging"
+          echo "image=$IMAGE" >> $GITHUB_OUTPUT
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+      - name: Record previous tag + update marker in S3
+        run: |
+          META_BUCKET="${{ vars.ARTIFACT_BUCKET }}"
+          IMAGE="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO}"
+          aws s3 cp s3://$META_BUCKET/deployments/staging/latest.txt latest.txt || echo "none" > latest.txt
+          mv latest.txt previous.txt || true
+          echo "${{ github.sha }}" > latest.txt
+          aws s3 cp previous.txt s3://$META_BUCKET/deployments/staging/previous.txt
+          aws s3 cp latest.txt   s3://$META_BUCKET/deployments/staging/latest.txt
+      - name: Deploy via SSM to instances tagged Environment=staging
+        run: |
+          IMAGE="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO}:staging"
+          aws ssm send-command             --document-name "AWS-RunShellScript"             --targets "Key=tag:Environment,Values=staging"             --parameters 'commands=["/usr/local/bin/deploy_app.sh staging '"$IMAGE"' '"${{ vars.STAGING_SECRET_ARN }}"' 80"]'             --comment "Deploy staging ${{ github.sha }}"
+  deploy-prod:
+    if: github.event_name == 'release' && github.event.action == 'published'
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: https://github.com/${{ github.repository }}/releases/tag/${{ github.event.release.tag_name }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20 }
+      - name: Configure AWS (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_PROD }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Login to ECR
+        uses: aws-actions/amazon-ecr-login@v2
+      - name: Build and push
+        run: |
+          IMAGE="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO}"
+          TAG="prod-${{ github.sha }}"
+          docker build -t "$IMAGE:$TAG" -f app/Dockerfile app
+          docker tag "$IMAGE:$TAG" "$IMAGE:prod"
+          docker push "$IMAGE:$TAG"
+          docker push "$IMAGE:prod"
+      - name: Record previous tag + update marker in S3
+        run: |
+          META_BUCKET="${{ vars.ARTIFACT_BUCKET }}"
+          aws s3 cp s3://$META_BUCKET/deployments/prod/latest.txt latest.txt || echo "none" > latest.txt
+          mv latest.txt previous.txt || true
+          echo "${{ github.sha }}" > latest.txt
+          aws s3 cp previous.txt s3://$META_BUCKET/deployments/prod/previous.txt
+          aws s3 cp latest.txt   s3://$META_BUCKET/deployments/prod/latest.txt
+      - name: Deploy via SSM to instances tagged Environment=production
+        run: |
+          IMAGE="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO}:prod"
+          aws ssm send-command             --document-name "AWS-RunShellScript"             --targets "Key=tag:Environment,Values=production"             --parameters 'commands=["/usr/local/bin/deploy_app.sh production '"$IMAGE"' '"${{ vars.PROD_SECRET_ARN }}"' 80"]'             --comment "Deploy production ${{ github.sha }}"
